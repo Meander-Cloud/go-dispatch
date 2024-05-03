@@ -1,0 +1,4 @@
+github.com/Meander-Cloud/go-dispatch v0.0.0-20240501232334-2de799173104 h1:+96jCqp7es59BjOdz3m+cc5qnKhx5GwxNX6koQA8r+g=
+github.com/Meander-Cloud/go-dispatch v0.0.0-20240501232334-2de799173104/go.mod h1:jP9Po3FCY9akgJBGCsBejenZnaEv4OW8f0xLo9zpB78=
+github.com/emirpasic/gods/v2 v2.0.0-alpha h1:dwFlh8pBg1VMOXWGipNMRt8v96dKAIvBehtCt6OtunU=
+github.com/emirpasic/gods/v2 v2.0.0-alpha/go.mod h1:W0y4M2dtBB9U5z3YlghmpuUhiaZT2h6yoeE+C1sCp6A=
