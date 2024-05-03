@@ -31,7 +31,8 @@ type event[K comparable] struct {
 }
 
 func (e *event[K]) reset() {
-	// e.serialID
+	var serialID K
+	e.serialID = serialID
 	e.functor = nil
 
 	e.t0 = time.Time{}
