@@ -19,3 +19,6 @@ Limits:
 - `GoroutineCount` in `Options` is of type `uint16`, therefore one can instantiate `Dispatcher` with up to 65535 goroutines, however this many goroutines is seldomly needed in a well designed application, and is against the package intention of saving runtime resources by fixing the number of goroutines and event queues at initialization
 - `QueueLength` in `Options` is of type `uint16`, therefore the max number of pending events for each goroutine queue before push would block is 65535, users are advised to specify a queue length within this limit that is inline with the characteristics of the application
 - event count in dispatcher internal structures is of type `uint32`, this is to accommodate excessive burst of calls to dispatch that may overflow `uint16`, however this condition may indicate a suboptimal usage pattern, or a traffic pattern not well supported by the dispatch algorithm in this package
+
+Dependencies:
+- this package relies on github.com/emirpasic/gods for parts of internal structures
