@@ -1,24 +1,22 @@
 package dispatcher
 
 import (
-	"cmp"
 	"fmt"
 	"log"
 	"sync"
 	"time"
 
 	rbt "github.com/emirpasic/gods/v2/trees/redblacktree"
+
+	"github.com/Meander-Cloud/go-chdyn/chdyn"
 )
 
 type Options struct {
-	// number of goroutines to be spawned by this dispatcher instance
-	GoroutineCount uint16
+	GoroutineCount uint16 // number of goroutines to be spawned by this dispatcher instance
 
-	// max number of pending events for each goroutine queue
-	QueueLength uint16
-
-	// whether to log event lifecycle
-	EnableLogging bool
+	LogPrefix string
+	LogDebug  bool
+	LogEvent  bool
 }
 
 type event[K comparable] struct {
@@ -41,303 +39,50 @@ func (e *event[K]) reset() {
 }
 
 type goroutineState[K comparable] struct {
-	queue chan *event[K]
-	load  uint32
+	exitch  chan struct{}
+	eventch *chdyn.Chan[*event[K]]
+
+	// must acquire mutex before accessing
+	load uint32
 }
 
 type Dispatcher[K comparable] struct {
-	options   *Options
-	eventPool *sync.Pool
+	*Options
+	exitwg  sync.WaitGroup
+	eventpl sync.Pool
 
-	statemu sync.Mutex
-	ready   bool
+	mutex sync.Mutex
+	ready bool
 
-	// goroutineIndex -> goroutineState
+	// index -> state
 	goroutineMap map[uint32]*goroutineState[K]
 
-	// load, goroutineIndex -> not used
+	// load, index -> not used
 	loadTree *rbt.Tree[[2]uint32, struct{}]
 
-	// serialID -> goroutineIndex, inflight serial event count
+	// serialID -> index, inflight event count
 	serialMap map[K][2]uint32
 }
 
-func (d *Dispatcher[K]) process(goroutineIndex uint32, pqueue *chan *event[K]) {
-	for {
-		err := func() error {
-			evt, sentBeforeClosed := <-(*pqueue)
-			if !sentBeforeClosed {
-				// exit condition
-				err := fmt.Errorf("goroutine=%d exiting", goroutineIndex)
-				if d.options.EnableLogging {
-					log.Printf("%s", err.Error())
-				}
-				return err
-			}
-
-			// recycle event
-			defer func() {
-				evt.reset()
-				d.eventPool.Put(evt)
-			}()
-
-			t3 := time.Now().UTC()
-
-			// invoke caller provided functor
-			// recover from panic, if any
-			func() {
-				defer func() {
-					rec := recover()
-					if rec != nil {
-						if d.options.EnableLogging {
-							log.Printf("recovered from event functor panic: %s", rec)
-						}
-					}
-				}()
-
-				evt.functor()
-			}()
-
-			t4 := time.Now().UTC()
-			var t5 time.Time
-
-			// now update structures
-			var serialGoroutineIndexCount [2]uint32
-			var newGoroutineLoad uint32
-			func() {
-				d.statemu.Lock()
-				defer d.statemu.Unlock()
-				t5 = time.Now().UTC()
-
-				goroutineState, found := d.goroutineMap[goroutineIndex]
-				if !found {
-					// fatal error
-					panic(fmt.Errorf("invalid dispatcher state [goroutine map corrupt], fatal"))
-				}
-
-				serialGoroutineIndexCount, found = d.serialMap[evt.serialID]
-				if !found {
-					// fatal error
-					panic(fmt.Errorf("invalid dispatcher state [serial map corrupt], fatal"))
-				}
-
-				newGoroutineLoad = goroutineState.load - 1
-
-				// update load tree
-				d.loadTree.Remove([2]uint32{goroutineState.load, goroutineIndex})
-				d.loadTree.Put([2]uint32{newGoroutineLoad, goroutineIndex}, struct{}{})
-
-				// update goroutine state
-				goroutineState.load = newGoroutineLoad
-
-				// update serial map
-				serialGoroutineIndexCount[1] -= 1
-				if serialGoroutineIndexCount[1] > 0 {
-					d.serialMap[evt.serialID] = serialGoroutineIndexCount
-				} else {
-					delete(d.serialMap, evt.serialID)
-				}
-			}()
-
-			t6 := time.Now().UTC()
-
-			// log event lifecycle
-			if d.options.EnableLogging {
-				log.Printf(
-					"serialID=%v finished on goroutine=%d, load=%d, count=%d, "+
-						"dspLockWait=%d, dspAlgElapsed=%d, goQueueWait=%d, evtFuncElapsed=%d, finLockWait=%d, finAlgElapsed=%d",
-					evt.serialID,
-					goroutineIndex,
-					newGoroutineLoad,
-					serialGoroutineIndexCount[1],
-					evt.t1.Sub(evt.t0).Microseconds(),
-					evt.t2.Sub(evt.t1).Microseconds(),
-					t3.Sub(evt.t2).Microseconds(),
-					t4.Sub(t3).Microseconds(),
-					t5.Sub(t4).Microseconds(),
-					t6.Sub(t5).Microseconds(),
-				)
-			}
-
-			return nil
-		}()
-		if err != nil {
-			return
-		}
-	}
-}
-
-func (d *Dispatcher[K]) Stop() {
-	d.statemu.Lock()
-	defer d.statemu.Unlock()
-
-	// disable dispatch
-	d.ready = false
-
-	// close channels to join goroutines
-	for _, goroutineState := range d.goroutineMap {
-		close(goroutineState.queue)
-	}
-}
-
-func (d *Dispatcher[K]) Dispatch(serialID K, functor func()) error {
-	eventAny := d.eventPool.Get()
-	evt, ok := eventAny.(*event[K])
-	if !ok {
-		err := fmt.Errorf("failed to cast event, corrupted pool, cannot dispatch")
-		if d.options.EnableLogging {
-			log.Printf("%s", err.Error())
-		}
-		return err
-	}
-
-	evt.serialID = serialID
-	evt.functor = functor
-	evt.t0 = time.Now().UTC()
-
-	var serialGoroutineIndexCount [2]uint32
-	var newGoroutineLoad uint32
-	var pqueue *chan *event[K]
-
-	err := func() error {
-		d.statemu.Lock()
-		defer d.statemu.Unlock()
-		evt.t1 = time.Now().UTC()
-
-		if !d.ready {
-			err := fmt.Errorf("dispatcher is not ready, cannot dispatch")
-			if d.options.EnableLogging {
-				log.Printf("%s", err.Error())
-			}
-			return err
-		}
-
-		var goroutineState *goroutineState[K]
-		var found bool
-
-		// first check if any inflight event already dispatched for this serialID
-		serialGoroutineIndexCount, found = d.serialMap[serialID]
-		if found {
-			goroutineState, found = d.goroutineMap[serialGoroutineIndexCount[0]]
-			if !found {
-				err := fmt.Errorf("invalid dispatcher state [goroutine map corrupt], cannot dispatch")
-				if d.options.EnableLogging {
-					log.Printf("%s", err.Error())
-				}
-				return err
-			}
-		} else {
-			// find goroutine with least load
-			it := d.loadTree.Iterator()
-			first := it.Next()
-			if !first {
-				err := fmt.Errorf("invalid dispatcher state [load tree corrupt], cannot dispatch")
-				if d.options.EnableLogging {
-					log.Printf("%s", err.Error())
-				}
-				return err
-			}
-
-			loadGoroutineIndex := it.Key()
-			goroutineState, found = d.goroutineMap[loadGoroutineIndex[1]]
-			if !found {
-				err := fmt.Errorf("invalid dispatcher state [goroutine map corrupt], cannot dispatch")
-				if d.options.EnableLogging {
-					log.Printf("%s", err.Error())
-				}
-				return err
-			}
-
-			// prepare for update
-			serialGoroutineIndexCount = [2]uint32{loadGoroutineIndex[1], 0}
-		}
-
-		newGoroutineLoad = goroutineState.load + 1
-
-		// update load tree
-		d.loadTree.Remove([2]uint32{goroutineState.load, serialGoroutineIndexCount[0]})
-		d.loadTree.Put([2]uint32{newGoroutineLoad, serialGoroutineIndexCount[0]}, struct{}{})
-
-		// update goroutine state
-		goroutineState.load = newGoroutineLoad
-
-		// update serial map
-		serialGoroutineIndexCount[1] += 1
-		d.serialMap[serialID] = serialGoroutineIndexCount
-
-		// important note: here we must release statemu before attempting to push to goroutine queue
-		// otherwise, if queue is already full, this will deadlock since process() needs to acquire
-		// statemu to update structures before pulling the next event from queue
-		pqueue = &goroutineState.queue
-
-		// release statemu
-
-		return nil
-	}()
-	if err != nil {
-		return err
-	}
-
-	evt.t2 = time.Now().UTC()
-
-	if d.options.EnableLogging {
-		log.Printf(
-			"dispatching serialID=%v -> goroutine=%d, load=%d, count=%d",
-			serialID,
-			serialGoroutineIndexCount[0],
-			newGoroutineLoad,
-			serialGoroutineIndexCount[1],
-		)
-	}
-
-	// in the very rare scenario where queues are closed during stop,
-	// and this caller happens to be concurrently pushing to this queue,
-	// recover from push to closed channel panic explicitly
-	func() {
-		defer func() {
-			rec := recover()
-			if rec != nil {
-				err = fmt.Errorf("%s", rec)
-				if d.options.EnableLogging {
-					log.Printf("%s", err.Error())
-				}
-			}
-		}()
-
-		(*pqueue) <- evt
-	}()
-	if err != nil {
-		return err
-	}
-	// do not access evt beyond this point
-
-	return nil
-}
-
-func New[K cmp.Ordered](options *Options) *Dispatcher[K] {
+func New[K comparable](options *Options) *Dispatcher[K] {
 	if options == nil {
 		panic(fmt.Errorf("nil options"))
 	}
 
-	if options.GoroutineCount <= 0 {
-		panic(fmt.Errorf("invalid GoroutineCount=%d", options.GoroutineCount))
-	}
-
-	if options.QueueLength <= 0 {
-		panic(fmt.Errorf("invalid QueueLength=%d", options.QueueLength))
+	if options.GoroutineCount == 0 {
+		panic(fmt.Errorf("%s: invalid GoroutineCount", options.LogPrefix))
 	}
 
 	d := &Dispatcher[K]{
-		options: options,
-		eventPool: &sync.Pool{
+		Options: options,
+		exitwg:  sync.WaitGroup{},
+		eventpl: sync.Pool{
 			New: func() any {
 				return &event[K]{}
 			},
 		},
-
-		// statemu
-		ready: false,
-
+		mutex:        sync.Mutex{},
+		ready:        false,
 		goroutineMap: make(map[uint32]*goroutineState[K]),
 		loadTree: rbt.NewWith[[2]uint32, struct{}](
 			func(a, b [2]uint32) int {
@@ -359,25 +104,344 @@ func New[K cmp.Ordered](options *Options) *Dispatcher[K] {
 		serialMap: make(map[K][2]uint32),
 	}
 
-	// since we are initializing, and there can be no concurrent invocation of Dispatch, no need to lock here
+	// since we are initializing, there can be no concurrent invocation of Dispatch, no need to lock here
 
 	var i uint16
 	for i = 0; i < options.GoroutineCount; i++ {
-		goroutineState := &goroutineState[K]{
-			queue: make(chan *event[K], options.QueueLength),
-			load:  0,
+		index := uint32(i)
+		state := &goroutineState[K]{
+			exitch: make(chan struct{}, 1),
+			eventch: chdyn.New(
+				&chdyn.Options[*event[K]]{
+					InSize:    chdyn.InSize,
+					OutSize:   chdyn.OutSize,
+					LogPrefix: fmt.Sprintf("%s<%d>", options.LogPrefix, index),
+					LogDebug:  options.LogDebug,
+				},
+			),
+			load: 0,
 		}
 
-		d.goroutineMap[uint32(i)] = goroutineState
-
-		d.loadTree.Put([2]uint32{0, uint32(i)}, struct{}{})
+		d.goroutineMap[index] = state
+		d.loadTree.Put([2]uint32{0, index}, struct{}{})
 
 		// spawn goroutine
-		go d.process(uint32(i), &goroutineState.queue)
+		d.exitwg.Add(1)
+		go d.process(
+			index,
+			state,
+		)
 	}
 
 	// enable dispatch
 	d.ready = true
+	if options.LogDebug {
+		log.Printf(
+			"%s: dispatch enabled, goroutineMap<%d>, loadTree<%d>, serialMap<%d>",
+			options.LogPrefix,
+			len(d.goroutineMap),
+			d.loadTree.Size(),
+			len(d.serialMap),
+		)
+	}
 
 	return d
+}
+
+func (d *Dispatcher[K]) Stop() {
+	if d.LogDebug {
+		log.Printf("%s: synchronized stop starting", d.LogPrefix)
+	}
+
+	func() {
+		d.mutex.Lock()
+		defer d.mutex.Unlock()
+
+		// disable dispatch
+		d.ready = false
+		if d.LogDebug {
+			log.Printf(
+				"%s: dispatch disabled, goroutineMap<%d>, loadTree<%d>, serialMap<%d>",
+				d.LogPrefix,
+				len(d.goroutineMap),
+				d.loadTree.Size(),
+				len(d.serialMap),
+			)
+		}
+
+		// signal goroutines to exit
+		for index, state := range d.goroutineMap {
+			select {
+			case state.exitch <- struct{}{}:
+			default:
+				if d.LogDebug {
+					log.Printf("%s<%d>: exitch already signaled", d.LogPrefix, index)
+				}
+			}
+		}
+	}()
+
+	d.exitwg.Wait()
+	if d.LogDebug {
+		log.Printf("%s: synchronized stop done", d.LogPrefix)
+	}
+}
+
+func (d *Dispatcher[K]) getEvent() *event[K] {
+	evtAny := d.eventpl.Get()
+	evt, ok := evtAny.(*event[K])
+	if !ok {
+		err := fmt.Errorf("%s: failed to cast event, evtAny=%#v", d.LogPrefix, evtAny)
+		log.Printf("%s", err.Error())
+		panic(err)
+	}
+	return evt
+}
+
+func (d *Dispatcher[K]) returnEvent(evt *event[K]) {
+	// recycle event
+	evt.reset()
+	d.eventpl.Put(evt)
+}
+
+func (d *Dispatcher[K]) process(index uint32, state *goroutineState[K]) {
+	if d.LogDebug {
+		log.Printf("%s<%d>: process goroutine starting", d.LogPrefix, index)
+	}
+
+	defer func() {
+		state.eventch.Stop()
+
+		if d.LogDebug {
+			log.Printf("%s<%d>: process goroutine exiting", d.LogPrefix, index)
+		}
+		d.exitwg.Done()
+	}()
+
+	inShutdown := false
+
+	handle := func(evt *event[K]) bool {
+		defer d.returnEvent(evt)
+
+		t3 := time.Now().UTC()
+
+		// invoke user functor
+		func() {
+			defer func() {
+				rec := recover()
+				if rec != nil {
+					if d.LogDebug {
+						log.Printf(
+							"%s<%d>: functor recovered from panic: %+v",
+							d.LogPrefix,
+							index,
+							rec,
+						)
+					}
+				}
+			}()
+			evt.functor()
+		}()
+
+		t4 := time.Now().UTC()
+		var t5 time.Time
+		var indexCountArray [2]uint32
+		var newLoad uint32
+
+		func() {
+			d.mutex.Lock()
+			defer d.mutex.Unlock()
+
+			t5 = time.Now().UTC()
+
+			var found bool
+			indexCountArray, found = d.serialMap[evt.serialID]
+			if !found {
+				err := fmt.Errorf("%s<%d>: serialID=%v not found in serial map", d.LogPrefix, index, evt.serialID)
+				log.Printf("%s", err.Error())
+				panic(err)
+			}
+
+			newLoad = state.load - 1
+
+			// update load tree
+			d.loadTree.Remove([2]uint32{state.load, index})
+			d.loadTree.Put([2]uint32{newLoad, index}, struct{}{})
+
+			// update goroutine state
+			state.load = newLoad
+
+			// update serial map
+			indexCountArray[1] -= 1
+			if indexCountArray[1] > 0 {
+				d.serialMap[evt.serialID] = indexCountArray
+			} else {
+				delete(d.serialMap, evt.serialID)
+			}
+		}()
+
+		t6 := time.Now().UTC()
+
+		// log event lifecycle
+		if d.LogEvent {
+			log.Printf(
+				"%s: %v <- <%d|%d|%d>, dspLockWait=%dµs, dspAlgElapsed=%dµs, evtQueueWait=%dµs, evtFuncElapsed=%dµs, finLockWait=%dµs, finAlgElapsed=%dµs",
+				d.LogPrefix,
+				evt.serialID,
+				index,
+				newLoad,
+				indexCountArray[1],
+				evt.t1.Sub(evt.t0).Microseconds(),
+				evt.t2.Sub(evt.t1).Microseconds(),
+				t3.Sub(evt.t2).Microseconds(),
+				t4.Sub(t3).Microseconds(),
+				t5.Sub(t4).Microseconds(),
+				t6.Sub(t5).Microseconds(),
+			)
+		}
+
+		if inShutdown &&
+			newLoad == 0 {
+			if d.LogDebug {
+				log.Printf("%s<%d>: all load drained", d.LogPrefix, index)
+			}
+			return true
+		} else {
+			return false
+		}
+	}
+
+	for {
+		select {
+		case <-state.exitch:
+			if d.LogDebug {
+				log.Printf("%s<%d>: exitch received", d.LogPrefix, index)
+			}
+
+			inShutdown = true
+
+			exit := func() bool {
+				d.mutex.Lock()
+				defer d.mutex.Unlock()
+
+				if state.load == 0 {
+					return true
+				} else {
+					if d.LogDebug {
+						log.Printf("%s<%d>: waiting for load to drain", d.LogPrefix, index)
+					}
+					return false
+				}
+			}()
+			if exit {
+				return // exit
+			}
+		case evt := <-state.eventch.Out():
+			exit := handle(evt)
+			if exit {
+				return // exit
+			}
+		}
+	}
+}
+
+func (d *Dispatcher[K]) Dispatch(serialID K, functor func()) error {
+	evt := d.getEvent()
+	evt.serialID = serialID
+	evt.functor = functor
+	evt.t0 = time.Now().UTC()
+
+	var indexCountArray [2]uint32
+	var newLoad uint32
+	var eventch *chdyn.Chan[*event[K]]
+
+	err := func() error {
+		d.mutex.Lock()
+		defer d.mutex.Unlock()
+
+		evt.t1 = time.Now().UTC()
+
+		if !d.ready {
+			err := fmt.Errorf("%s: ready=%t, cannot dispatch", d.LogPrefix, d.ready)
+			if d.LogDebug {
+				log.Printf("%s", err.Error())
+			}
+			return err
+		}
+
+		var state *goroutineState[K]
+		var found bool
+
+		// first check if any inflight event already dispatched for this serialID
+		indexCountArray, found = d.serialMap[serialID]
+		if found {
+			state, found = d.goroutineMap[indexCountArray[0]]
+			if !found {
+				err := fmt.Errorf("%s: index=%d not found in goroutine map", d.LogPrefix, indexCountArray[0])
+				log.Printf("%s", err.Error())
+				return err
+			}
+		} else {
+			// find goroutine with least load
+			it := d.loadTree.Iterator()
+			first := it.First()
+			if !first {
+				err := fmt.Errorf("%s: invalid load tree", d.LogPrefix)
+				log.Printf("%s", err.Error())
+				return err
+			}
+
+			loadIndexArray := it.Key()
+			state, found = d.goroutineMap[loadIndexArray[1]]
+			if !found {
+				err := fmt.Errorf("%s: index=%d not found in goroutine map", d.LogPrefix, loadIndexArray[1])
+				log.Printf("%s", err.Error())
+				return err
+			}
+
+			// prepare for update
+			indexCountArray = [2]uint32{loadIndexArray[1], 0}
+		}
+
+		newLoad = state.load + 1
+
+		// update load tree
+		d.loadTree.Remove([2]uint32{state.load, indexCountArray[0]})
+		d.loadTree.Put([2]uint32{newLoad, indexCountArray[0]}, struct{}{})
+
+		// update goroutine state
+		state.load = newLoad
+
+		// update serial map
+		indexCountArray[1] += 1
+		d.serialMap[serialID] = indexCountArray
+
+		// prepare to push event
+		eventch = state.eventch
+
+		return nil
+	}()
+	if err != nil {
+		d.returnEvent(evt)
+		return err
+	}
+
+	evt.t2 = time.Now().UTC()
+
+	// log event lifecycle
+	if d.LogEvent {
+		log.Printf(
+			"%s: %v -> <%d|%d|%d>",
+			d.LogPrefix,
+			serialID,
+			indexCountArray[0],
+			newLoad,
+			indexCountArray[1],
+		)
+	}
+
+	eventch.In() <- evt
+	// do not access evt beyond this point
+
+	return nil
 }
